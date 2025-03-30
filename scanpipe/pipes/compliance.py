@@ -110,14 +110,19 @@ def get_project_compliance_alerts(project, fail_level="error"):
 
     return project_compliance_alerts
 
-# Add to existing compliance.py file
 
-def evaluate_license_clarity(license_detection):
+def calculate_license_clarity_score(license_detection):
     """
     Calculate a clarity score for a license detection.
     
     A higher score indicates greater confidence in the license detection.
-    Based on the highest match score in the detection.
+    The score is based on the highest match score in the detection.
+    
+    Args:
+        license_detection: A license detection dictionary from scan results
+        
+    Returns:
+        A score between 0 and 100 representing the clarity of the license detection
     """
     if not license_detection or not license_detection.get("matches"):
         return 0
@@ -135,15 +140,19 @@ def get_clarity_compliance_alert(clarity_score, policies):
         policies: The parsed policies dictionary containing clarity_policies
         
     Returns:
-        The compliance alert level (empty string, 'warning', or 'error')
+        The compliance alert level (empty string, 'info', 'warning', or 'error')
     """
     clarity_policies = policies.get("clarity_policies", [])
-    
-    # Sort by threshold descending to find the highest applicable threshold
-    sorted_policies = sorted(clarity_policies, key=lambda x: x.get("threshold", 0), reverse=True)
+
+    sorted_policies = sorted(
+        clarity_policies, 
+        key=lambda x: x.get("threshold", 0), 
+        reverse=True
+    )
     
     for policy in sorted_policies:
-        if clarity_score >= policy.get("threshold", 0):
+        threshold = policy.get("threshold", 0)
+        if clarity_score >= threshold:
             return policy.get("compliance_alert", "")
     
     return ""
@@ -158,25 +167,34 @@ def validate_resource_license_clarity(resource, policies):
         resource: A CodebaseResource instance
         policies: The parsed policies dictionary
     """
-    # Skip resources without license detections
-    if not hasattr(resource, "license_detections") or not resource.license_detections:
+    if not resource.license_detections:
         return
     
-    # Calculate clarity score as the highest match score across all detections
-    clarity_scores = []
-    for detection in resource.license_detections:
-        clarity_scores.append(evaluate_license_clarity(detection))
+    clarity_scores = [
+        calculate_license_clarity_score(detection) 
+        for detection in resource.license_detections
+    ]
     
     resource_clarity_score = max(clarity_scores) if clarity_scores else 0
-    
-    # Check clarity score against policies
+
     clarity_alert = get_clarity_compliance_alert(resource_clarity_score, policies)
-    
-    # Update resource compliance alert if clarity check fails
-    # (only if current alert is empty or clarity alert is more severe)
-    if clarity_alert and (not resource.compliance_alert or 
-                          (clarity_alert == "error" and resource.compliance_alert == "warning")):
+
+    if clarity_alert and (
+        not resource.compliance_alert or 
+        (clarity_alert == "error" and resource.compliance_alert == "warning")
+    ):
         resource.compliance_alert = clarity_alert
+        resource.save()
+
+        if not hasattr(resource, "compliance_details"):
+            resource.compliance_details = {}
+        
+        resource.compliance_details["license_clarity_score"] = resource_clarity_score
+        resource.compliance_details["license_clarity_threshold"] = next(
+            (p.get("threshold") for p in policies.get("clarity_policies", [])
+             if p.get("compliance_alert") == clarity_alert),
+            None
+        )
         resource.save()
 
 
@@ -190,11 +208,18 @@ def check_license_clarity_compliance(project, policies=None):
     """
     if policies is None:
         policies = project.load_policies() or {}
-    
-    # Skip if no clarity policies defined
+
     if not policies.get("clarity_policies"):
         return
-    
+
     resources = project.codebaseresources.has_licenses()
+    
     for resource in resources:
         validate_resource_license_clarity(resource, policies)
+    
+    return {
+        "total_resources_checked": resources.count(),
+        "resources_with_clarity_issues": resources.filter(
+            compliance_alert__in=["warning", "error"]
+        ).count(),
+    }
